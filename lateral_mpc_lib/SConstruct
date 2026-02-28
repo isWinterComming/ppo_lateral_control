@@ -1,0 +1,19 @@
+import glob
+
+
+env = Environment(CC = "gcc", CXX = "g++", CCFLAGS = "-D PORTABLE_WORDSIZES")
+
+com_head = ['./lat_mpc_ert_rtw/', 
+			]
+
+com_src = glob.glob('./lat_mpc_ert_rtw/*.c')
+
+
+
+
+print('header files: ', com_head)
+
+print('source files: ', com_src)
+
+env.SharedLibrary('lat_mpc', com_src, CPPPATH = com_head)
+
