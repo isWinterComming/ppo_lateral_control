@@ -1,42 +1,14 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 import numpy as np
-from torch.distributions import Normal
-import sys
-import os
 from scipy.integrate import odeint
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional
-import copy
 from collections import deque
 import torch.optim as optim
 from lateral_mpc_lib.lat_mpc import LatMpc
 # from Pendulum_PPO import PI_Network
+from tinygrad.nn.state import load_state_dict
 
-
-class PI_Network(nn.Module):
-    def __init__(self, obs_dim, action_dim, lower_bound, upper_bound) -> None:
-        super().__init__()
-        (
-            self.lower_bound,
-            self.upper_bound
-        ) = (
-            torch.tensor(lower_bound, dtype=torch.float32),
-            torch.tensor(upper_bound, dtype=torch.float32)
-        )
-        self.fc1 = nn.Linear(obs_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, action_dim)
-
-    def forward(self, obs):
-        y = F.tanh(self.fc1(obs))
-        y = F.tanh(self.fc2(y))
-        action =  F.tanh(self.fc3(y))
-
-        action = (action + 1)*(self.upper_bound - self.lower_bound)/2+self.lower_bound
-
-        return action
     
     
 def warn_cosin_learningRate(epoch, warmup_epochs, optimizer, scheduler):
@@ -132,8 +104,8 @@ class DrivingSimulator:
         # max_kappa = min(max_ay / ( v0 ** 2), 0.04)
         in_A0 = (np.random.rand() - 0.5) * 2.0
         in_A1 = (np.random.rand() - 0.5) * 0.1
-        in_A2 = (np.random.rand() - 0.5) * 0.004
-        in_A3 = (np.random.rand() - 0.5) * 0.00001
+        in_A2 = (np.random.rand() - 0.5) * 0.000
+        in_A3 = (np.random.rand() - 0.5) * 0.0000
 
         in_yawrate_degps =  (2 * in_A2 * v0 * 180 / np.pi + np.random.randn() * 1.0)
 
@@ -154,15 +126,15 @@ class DrivingSimulator:
         desired_psi_rate_degps = in_yawrate_degps
 
 
-        self.delay_time = np.random.rand() * 0.2
-        # self.delay_time = 0.1
+        # self.delay_time = np.random.rand() * 0.2
+        self.delay_time = 0.1
         self.delay_steps = round(self.delay_time/self.dt)
         self.control_queue = [desired_psi_rate_degps for i in range(self.delay_steps + 1)]
 
         self.psi_rate_degps_last = in_yawrate_degps
         self.cof_last = [self.a3, self.a2, self.a1, self.a0]
 
-        return np.array([v0, self.a0, self.a1, self.a2 * (v0 + 5) ** 2, self.a3 * (v0 + 5) ** 3, in_yawrate_degps, self.delay_time]).reshape(1, 7), None
+        return np.array([v0, self.a0, self.a1, in_yawrate_degps]).reshape(1, 4), None
 
 
     def step(self, action, is_active=True):
@@ -173,10 +145,10 @@ class DrivingSimulator:
         v_ego = self.state[-1]
         
         # print('action: ', action)
-        self.control_queue.append(action[0][0])
-        self.control_queue.pop(0)
+        # self.control_queue.append(action[0][0])
+        # self.control_queue.pop(0)
 
-        psi_rate_degps = self.control_queue[0]
+        psi_rate_degps = action.item() #self.control_queue[0]
 
         # update next state.
         t = [i*self.dt for i in range(20)]
@@ -193,7 +165,7 @@ class DrivingSimulator:
 
         # measurement, add noise and get next iteration state.
         in_yawrate_degps = psi_rate_degps + 0.1 * np.random.randn()
-        next_state = np.array([v_ego, cof[3], cof[2], cof[1] * (v_ego + 5) ** 2, cof[0] * (v_ego + 5) ** 3, in_yawrate_degps, self.delay_time]).reshape(1, 7)
+        next_state = np.array([v_ego, cof[3], cof[2],in_yawrate_degps]).reshape(1, 4)
         self.psi_rate_degps_last = psi_rate_degps
         self.cof_last = cof
         
@@ -325,8 +297,34 @@ class DrivingSimulator:
         plt.show()
 
     def test_model_rl(self, n):
-        model = PI_Network(7,1,-10,10)
-        model.load_state_dict(torch.load('./saved_network/pi_network.pth'))
+        from tinygrad import Tensor
+        import tinygrad
+        import math
+        class PI_Network():
+            def __init__(self, obs_dim, action_dim, lower_bound, upper_bound) -> None:
+                super().__init__()
+                self.lower_bound = lower_bound
+                self.upper_bound = upper_bound
+
+                self.fc1 = tinygrad.nn.Linear(obs_dim, 64)
+                self.fc2 = tinygrad.nn.Linear(64, 64)
+                self.fc3 = tinygrad.nn.Linear(64, action_dim)
+                # self.fc4 = nn.Linear(128, action_dim)
+                self.log_std = Tensor([math.log(1.5)], requires_grad=True)
+                
+            def __call__(self, obs):
+                y = self.fc1(obs).tanh()
+                y = self.fc2(y).tanh()
+                action = self.fc3(y).tanh()
+                action = (action + 1)*(self.upper_bound - self.lower_bound)/2 + self.lower_bound
+                return action, self.log_std.exp()
+    
+        pi_network = PI_Network(4,1,-10, 10)
+        import pickle
+        with open(f"saved_network/pi_network.pkl", "rb") as f:
+            state_dict_policy = pickle.load(f)
+        load_state_dict(pi_network, state_dict_policy)
+
         # model.eval()
         init_stat,_ = self.reset()
         gt_lat_mpc = LatMpc()
@@ -339,7 +337,6 @@ class DrivingSimulator:
         ctrl_yr = []
 
         ctrl_state_mpc = []
-
         ctrl_time = [i * self.dt for i in range(100)]
         for t in range(100):
             # print(init_stat)
@@ -347,18 +344,17 @@ class DrivingSimulator:
             init_stat = init_stat[0]
             pos_err.append(init_stat[1])
             heading_error.append(init_stat[2])
-            state_yr.append(init_stat[5])
-            
+            state_yr.append(init_stat[3])
             ctrl_state.append(True)
-            tx_in = torch.from_numpy(init_stat).float()
-            pred_out  = model(tx_in.reshape(1, 7)) # here is radps
-            # print(pred_out)
 
-            print('action mean:', pred_out.cpu().detach().numpy()  )
-            gt_out_degps = (180/np.pi) * gt_lat_mpc.update(True, init_stat[3], init_stat[0], init_stat[1],  init_stat[2], init_stat[3]/(init_stat[0] + 5)**2, init_stat[4]/(init_stat[0] + 5)**3, 0.0, 0.0)
+            pred_out, std  = pi_network(Tensor(init_stat)) # here is radps
+            # print(pred_out)
+            pred_out = pred_out.numpy()
+            print('action mean:', pred_out  )
+            gt_out_degps = (180/np.pi) * gt_lat_mpc.update(True, init_stat[3], init_stat[0], init_stat[1],  init_stat[2], 0,0, 0.0, 0.0)
             ctrl_state_mpc.append(gt_out_degps)
-            ctrl_yr.append(pred_out[0].cpu().detach().numpy() )
-            init_stat ,_, _, _, _ = self.step(pred_out.detach().cpu().numpy())
+            ctrl_yr.append(pred_out )
+            init_stat ,_, _, _, _ = self.step(pred_out)
 
         plt.subplot(4, 1, 1)
         plt.plot(ctrl_time, ctrl_yr, label='RL model yawrate')
@@ -380,7 +376,7 @@ class DrivingSimulator:
         plt.ylim([-40, 40])
 
         # plt.show()
-        plt.savefig(f'./test{n}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'saved_images/test{n}.png', dpi=150, bbox_inches='tight')
         plt.clf()
         
     # def eval_model(self, policy_model, eposide_nm):

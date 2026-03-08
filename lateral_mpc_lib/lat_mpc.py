@@ -116,7 +116,7 @@ class LatMpc():
         self.ffi = get_mpc_cffi()
         self.res    = self.ffi.new('float[30]')
         self.res_valid = self.ffi.new('unsigned char *')
-        self.lib    = self.ffi.dlopen('./lateral_mpc_lib/liblat_mpc.dylib')
+        self.lib    = self.ffi.dlopen('./lateral_mpc_lib/liblat_mpc.so')
         self.lib.lat_mpc_initialize()
 
         self.k_pos = float(0.02)

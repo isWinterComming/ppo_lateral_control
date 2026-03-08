@@ -1,4 +1,3 @@
-from asyncore import write
 import os
 import sys
 import torch
@@ -32,9 +31,9 @@ class PI_Network(nn.Module):
             torch.tensor(lower_bound, dtype=torch.float32),
             torch.tensor(upper_bound, dtype=torch.float32)
         )
-        self.fc1 = nn.Linear(obs_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, action_dim)
+        self.fc1 = nn.Linear(obs_dim, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_dim)
 
     def forward(self, obs):
         y = F.tanh(self.fc1(obs))
@@ -49,9 +48,9 @@ class V_Network(nn.Module):
     def __init__(self, obs_dim) -> None:
         super().__init__()
 
-        self.fc1 = nn.Linear(obs_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 1)
+        self.fc1 = nn.Linear(obs_dim, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 1)
 
     def forward(self, obs):
         y = F.tanh(self.fc1(obs))
@@ -69,7 +68,7 @@ if __name__ == "__main__":
     # lower_bound = env.action_space.low
     # upper_bound = env.action_space.high
     env = DrivingSimulator()
-    obs_dim = 7
+    obs_dim = 4
     action_dim = 1
     lower_bound = -10
     upper_bound = 10.
@@ -154,7 +153,7 @@ if __name__ == "__main__":
                         advantage_batch = batch_data[k]['advantage']
                         return_batch = batch_data[k]['return']
 
-
+                        # print(advantage_batch.std(), advantage_batch.mean())    
                         # Normalize advantage
                         advantage_batch = (
                             advantage_batch -
