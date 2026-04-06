@@ -102,18 +102,18 @@ class LatMpc():
         self.ffi = get_mpc_cffi()
         self.res    = self.ffi.new('float[30]')
         self.res_valid = self.ffi.new('unsigned char *')
-        self.lib    = self.ffi.dlopen('./control/liblat_mpc.so')
+        self.lib    = self.ffi.dlopen('./control/liblat_mpc.dylib')
         self.lib.lat_mpc_initialize()
 
         self.k_pos = float(0.01)
-        self.k_heading = float(1.)
+        self.k_heading = float(.1)
         self.k_control = float(500.)
-        self.T_IDX = np.linspace(0.05, 2.5, 30)
+        self.T_IDX = np.linspace(0.05, 1.8, 30)
 
         # print(self.T_IDX)
 
         self.last_u = 0.
-        self.prev_time = 0.3
+        self.prev_time = 0.1
         self.des_yawrate = 0.
 
         self.STEER_RATIO = 16.2
@@ -149,13 +149,12 @@ class LatMpc():
 
 
         # yawrate to steering angle
-        c_TJA_d_WheelBase_sg = 2.8
+        c_TJA_d_WheelBase_sg = 3.0
         Ffw_angD_DesPinAngle_sg = math.atan(desired_yawrate/max(0.1, v_ego) * c_TJA_d_WheelBase_sg) * 180/ np.pi  # wheel angle
 
-        k_UndStrGrd = 2.0
+        k_UndStrGrd = 1.0
         g = 9.8
         underSteerGradFct = desired_yawrate * v_ego * k_UndStrGrd /g
-
         ffw_wheel_angle = Ffw_angD_DesPinAngle_sg + underSteerGradFct + 0.1*(desired_yawrate*180./np.pi - current_yawrate_degps )
         #print(desired_yawrate, prev_n, ffw_wheel_angle, current_yawrate_degps * np.pi/180., Ffw_angD_DesPinAngle_sg,  underSteerGradFct)
 
@@ -175,6 +174,14 @@ class LatMpc():
         # pm_data['Hdang_err'] = C1
 
         # self.pb.publish(pm_data)
+
+        # prev_dy = np.interp(1.6, traj_t, traj_y)
+        # pred_dx = np.interp(1.6, traj_t, traj_x)
+        # pred_kappa = 2 * prev_dy / (prev_dy ** 2 + pred_dx**2)
+        # pred_steer = math.atan(pred_kappa * c_TJA_d_WheelBase_sg) * 180/ np.pi  # wheel angle
+        # desired_yawrate = v_ego * pred_kappa
+        # underSteerGradFct = desired_yawrate * v_ego * k_UndStrGrd /g
+        # ffw_wheel_angle = pred_steer + underSteerGradFct + 0.2*(desired_yawrate*180./np.pi - current_yawrate_degps )
 
         self.steer_out =  ffw_wheel_angle
 

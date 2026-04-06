@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
 Log
+./e2e_metadrive_test/images/
+./e2e_metadrive_test/output.mp4

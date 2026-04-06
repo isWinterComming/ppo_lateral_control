@@ -4,17 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 import numpy as np
+#from utils import valid_segment_slice, ANCHOR_TIME
 import torchvision.models as models
 import time
-
-ANCHOR_TIME = np.array((0.        ,  0.00976562,  0.0390625 ,  0.08789062,  0.15625   ,
-                        0.24414062,  0.3515625 ,  0.47851562,  0.625     ,  0.79101562,
-                        0.9765625 ,  1.18164062,  1.40625   ,  1.65039062,  1.9140625 ,
-                        2.19726562,  2.5       ,  2.82226562,  3.1640625 ,  3.52539062,
-                        3.90625   ,  4.30664062,  4.7265625 ,  5.16601562,  5.625     ,
-                        6.10351562,  6.6015625 ,  7.11914062,  7.65625   ,  8.21289062,
-                        8.7890625 ,  9.38476562, 10.))
-
 
 class GRU1D(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -41,13 +33,14 @@ class ResBlock1D(nn.Module):
 
         self.block = nn.Sequential(
             nn.Linear(in_size, res_size),
-            nn.Dropout(drop_cof),
             nn.ReLU(),
+            nn.Dropout(drop_cof),
             nn.Linear(res_size, in_size),
         )
 
     def forward(self, x):
         return torch.nn.functional.relu(x + self.block(x))
+        # return x + self.block(x)
 
 
 class GRU(nn.Module):
@@ -202,18 +195,15 @@ class PlanningModel(nn.Module):
 
     def __init__(self):
         super(PlanningModel, self).__init__()
-
+        self.enc = EfficientNet.from_pretrained('efficientnet-b1', in_channels=6)
         self.feat_head = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
+        # 6, 450, 800 -> 1408, 14, 25
+        # nn.AdaptiveMaxPool2d((4, 8)),  # 1408, 4, 8
+        nn.BatchNorm2d(1280),
+        nn.Conv2d(1280, 32, 1),  # 32, 4, 8
+        nn.BatchNorm2d(32),
+        nn.ReLU(),
+        nn.Flatten(),
         )
         
         self.plan_head = nn.Sequential(
@@ -233,10 +223,18 @@ class PlanningModel(nn.Module):
         self.pose_head = nn.Sequential(
             nn.Linear(512, 64),
             nn.ReLU(),
-            ResBlock1D(64, 128),
-            nn.Linear(64, 64),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            ResBlock1D(32, 32),
+            nn.Linear(32, 64),
         )
         # self.tf = SimpleTransformer()
+
+        self.l2_norm = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            )
 
         self.lat_enc = nn.Sequential(
             nn.Linear(512, 128),
@@ -244,12 +242,23 @@ class PlanningModel(nn.Module):
         )
 
 
-    def forward(self, latent_feature, feat_buff):
+    def forward(self, feed_imgs, feat_buff):
         # print(latent_feature.shape)
-        x0 = self.feat_head(latent_feature)
+        big_imgs = feed_imgs/255. # to[0,1]
+        IMAGENET_MEAN = [0.485, 0.456, 0.406] # rgb
+        IMAGENET_STD = [0.229, 0.224, 0.225]
+        big_imgs[:,0] = feed_imgs[:,0]/IMAGENET_STD[0] - IMAGENET_MEAN[0] # r
+        big_imgs[:,1] = feed_imgs[:,1]/IMAGENET_STD[1] - IMAGENET_MEAN[1] # g
+        big_imgs[:,2] = feed_imgs[:,2]/IMAGENET_STD[2] - IMAGENET_MEAN[2] # b
+        big_imgs[:,3] = feed_imgs[:,3]/IMAGENET_STD[0] - IMAGENET_MEAN[0] # r
+        big_imgs[:,4] = feed_imgs[:,4]/IMAGENET_STD[1] - IMAGENET_MEAN[1] # g
+        big_imgs[:,5] = feed_imgs[:,5]/IMAGENET_STD[2] - IMAGENET_MEAN[2] # b
+        
+        xf = self.feat_head(self.enc.extract_features(big_imgs ) )
+        x0 = self.l2_norm(xf)
         # print(x0.shape)
-        # noise generation
-        SNR = 2 ** 4 - 1
+        # noise generation, C = 640.0 bits
+        SNR = 2 ** 2.5 - 1
         if self.training:
             x1 = torch.nn.functional.normalize(x0, p=2.0, dim=1, eps=1e-12)*np.sqrt(
                 SNR*x0.shape[-1]) + 1*torch.randn(x0.shape, device=x0.device)
@@ -269,307 +278,7 @@ class PlanningModel(nn.Module):
         # x_enc = self.tf(torch.cat([feat_buff[:, -8:, :], x1.view(-1, 1, 512)], dim=1))
 
         plan_preds = self.plan_head(x_enc)
-        pose_preds = self.pose_head(x1)
+        pose_preds = self.pose_head(x0)
         out_preds = torch.cat([x1, plan_preds, pose_preds], dim=1)
         return out_preds, x1
-
-
-class MTPLoss(nn.Module):
-    """mulit predict trajectory , could refer ..."""
-
-    def __init__(self):
-        super(MTPLoss, self).__init__()
-        self.reg_loss_func_L1 = nn.SmoothL1Loss(reduction="none")
-        self.reg_loss_func_mse = nn.MSELoss(reduction="none")
-        self.cls_loss_func = nn.CrossEntropyLoss()
-        self.distance_func = nn.CosineSimilarity(dim=2)
-        self.prob_func = nn.Softmax(dim=0)
-
-        self.traj_len = 33
-        self.traj_num = 5
-        self.elu = nn.ELU()
-        self.count = 0
-        self.is_use_angle_dist = True
-
-    def kl_reg_loss(
-        self,
-        eps: float,
-        gt: torch.Tensor,
-        mean_pred: torch.Tensor,
-        std_pred: torch.Tensor,
-        ep,
-    ) -> torch.Tensor:
-        # get mean error
-        # mean_y = gt.mean().cpu().numpy()
-        # mean_err = (mean_pred - gt).mean().cpu().numpy()
-        # because we most want to get good mean value, should we train 5 steps eveary one varance update
-        # if self.count %20==0:
-        #   sigma = torch.add(self.elu(std_pred), 1+eps)
-        # else:
-        #   sigma = torch.add(self.elu(std_pred), 1+eps).detach()
-
-        # sigma = torch.add(self.elu(std_pred), 1+eps)
-        # prob = 1/(2*sigma)*torch.exp(-torch.abs(gt - mean_pred)/sigma)
-
-        sigma = torch.add(self.elu(std_pred), 1 + eps)
-        m_x = torch.distributions.laplace.Laplace(loc=mean_pred, scale=sigma)
-        # with same prob, we want the simma more lower
-        loss_x = (
-            -1 * (m_x.log_prob(gt)) * min(1, (ep+1) / 8)
-            + self.reg_loss_func_L1(mean_pred, gt) * max(0.1, 1 - (ep+1) / 8)
-            + 0.1 * self.reg_loss_func_L1(sigma, 0 * sigma)
-        )
-        # loss_x = self.reg_loss_func_L1(mean_pred, gt)
-        return loss_x
-
-    def kl_reg_loss_L1(
-        self,
-        eps: float,
-        gt: torch.Tensor,
-        mean_pred: torch.Tensor,
-        log_sigma: torch.Tensor,
-    ) -> torch.Tensor:
-        # because we most want to get good mean value, should we train 5 steps eveary one varance update
-        if self.count % 100 == 0:
-            sigma = torch.add(self.elu(log_sigma), 1 + eps)
-            # sigma = torch.exp(log_std)
-        else:
-            sigma = torch.add(self.elu(log_sigma), 1 + eps).detach()
-        # smooth l1 losss already divide by 2.
-        return torch.log(sigma * sigma) / 2.0 + self.reg_loss_func_L1(mean_pred, gt) / (
-            sigma * sigma
-        )
-
-    def kl_reg_loss_fix_std(
-        self,
-        eps: float,
-        gt: torch.Tensor,
-        mean_pred: torch.Tensor,
-        std_pred: torch.Tensor,
-    ) -> torch.Tensor:
-        # return (2*torch.log(sigma) + smooth_L1_err/(sigma*sigma))/2.
-        sigma = 1.0
-        return (
-            np.log(np.sqrt(2 * np.pi))
-            + np.log(sigma)
-            + self.reg_loss_func_mse(mean_pred, gt) / (2 * sigma * sigma)
-        )
-        # return np.log(np.sqrt(2*np.pi)) + torch.log(sigma) + self.reg_loss_func_mse(mean_pred, gt)/(2*sigma*sigma) + torch.log(sigma)
-
-    def kl_reg_loss_L1_fix_std(
-        self,
-        eps: float,
-        gt: torch.Tensor,
-        mean_pred: torch.Tensor,
-        std_pred: torch.Tensor,
-    ) -> torch.Tensor:
-        # return (2*torch.log(sigma) + smooth_L1_err/(sigma*sigma))/2.
-        sigma = 1.0
-        return (
-            np.log(np.sqrt(2 * np.pi))
-            + np.log(sigma)
-            + self.reg_loss_func_L1(mean_pred, gt) / (sigma * sigma)
-        )
-        # return np.log(np.sqrt(2*np.pi)) + torch.log(sigma) + self.reg_loss_func_L1(mean_pred, gt)/(2*sigma)
-
-    def get_mdn_loss(
-        self,
-        eps: float,
-        gt: torch.Tensor,
-        mean_pred: torch.Tensor,
-        std_pred: torch.Tensor,
-        norm_factor=1.0,
-    ) -> torch.Tensor:
-
-        # sigma_x = torch.add(self.elu(std_pred), 1+eps)
-        sigma = torch.add(self.elu(std_pred), 1 + eps)
-        # sigma   = torch.exp(std_pred)
-        # sigma   = torch.exp(std_pred)
-        m_x = torch.distributions.Normal(
-            loc=mean_pred / norm_factor, scale=sigma / norm_factor
-        )
-        # with same prob, we want the simma more lower
-        loss_x = -1 * (m_x.log_prob(gt / norm_factor))  # + torch.log(sigma)
-        return loss_x
-
-    def forward(
-        self,
-        is_closeloop,
-        cls_weight: float,
-        pred_buffer: torch.Tensor,
-        gt: torch.Tensor,
-        gt_pose: torch.Tensor,
-        ep: float,
-    ) -> torch.Tensor:
-        """current use angle distance to get closest trajectory"""
-        st = time.time()
-        # resample
-        bat_sz = gt.shape[0]
-        gt_traj = gt.reshape(bat_sz, 1, 33, 3).expand(
-            -1, self.traj_num, 33, 3
-        )  # B,1,3->B,M,3
-
-        # ## reconstruct image loss.
-        # recon_loss = F.smooth_l1_loss(127.5*(recon_images + 1.0), real_img_bat, reduction='none').mean()
-
-        # trajectory loss.
-        cls_sz = self.traj_num
-        traj_sz = self.traj_len * self.traj_num * 3
-
-        plan_cls = pred_buffer[:, 0:cls_sz]
-        pred_traj = pred_buffer[:, cls_sz: cls_sz + traj_sz].reshape(
-            -1, self.traj_num, self.traj_len, 3
-        )
-        pred_traj_std = pred_buffer[
-            :, cls_sz + traj_sz: cls_sz + traj_sz + traj_sz
-        ].reshape(-1, self.traj_num, self.traj_len, 3)
-
-        outputs = pred_buffer[:, cls_sz + traj_sz + traj_sz:]
-
-        pred_pose = outputs[:, 0:6]
-        pred_pose_std = outputs[:, 6:12]
-
-        m_loss_x_L1 = self.reg_loss_func_L1(
-            pred_traj[:, :, :, 0], gt_traj[:, :, :, 0]
-        ).mean(dim=2)
-        m_loss_y_L1 = self.reg_loss_func_L1(
-            pred_traj[:, :, :, 1], gt_traj[:, :, :, 1]
-        ).mean(dim=2)
-        # m_loss_z_L1 = self.reg_loss_func_L1( pred_traj[:,:,:, 2], gt_traj[:, :,:, 2]).mean(dim=2)
-
-        m_loss_vx = self.reg_loss_func_L1(
-            pred_pose[:, 0], gt_pose[:, 0]).mean()
-        m_loss_wz = self.reg_loss_func_L1(
-            pred_pose[:, 5], gt_pose[:, 5]).mean()
-        # print( (time.time() - st) * 15)
-
-        # -------> caculate regression loss
-        vx_loss = self.kl_reg_loss(
-            1e-6, gt_pose[:, 0], pred_pose[:, 0], pred_pose_std[:, 0], ep
-        ).mean()
-        # vy_loss = self.kl_reg_loss(1e-6, gt_pose[:,1], pred_pose[:, 1], pred_pose_std[:, 1]).mean()
-        # vz_loss = self.kl_reg_loss(1e-6, gt_pose[:,2], pred_pose[:, 2], pred_pose_std[:, 2]).mean()
-        # wx_loss = self.kl_reg_loss(1e-6, gt_pose[:,3], pred_pose[:, 3], pred_pose_std[:, 3]).mean()
-        # wy_loss = self.kl_reg_loss(1e-6, gt_pose[:,4], pred_pose[:, 4], pred_pose_std[:, 4]).mean()
-        w_wz = 0 if is_closeloop else 1  # closeloop not training wz loss
-        wz_loss = (
-            w_wz
-            * self.kl_reg_loss(
-                1e-6, gt_pose[:, 5], pred_pose[:, 5], pred_pose_std[:, 5], ep
-            ).mean()
-        )
-
-        # wz is not correct now, so we not train it!!!
-        pose_loss = vx_loss + wz_loss
-
-        # -------> caculate distance loss
-        # loss_x  = self.get_mdn_loss(1e-3, gt_traj[:,:,:, 0], pred_traj[:, :,:, 0], pred_traj[:, :,:, 3])
-        loss_x = self.kl_reg_loss(
-            1e-6,
-            gt_traj[:, :, :, 0],
-            pred_traj[:, :, :, 0],
-            pred_traj_std[:, :, :, 0],
-            ep,
-        ).mean(dim=2)
-        loss_y = self.kl_reg_loss(
-            1e-6,
-            gt_traj[:, :, :, 1],
-            pred_traj[:, :, :, 1],
-            pred_traj_std[:, :, :, 1],
-            ep,
-        ).mean(dim=2)
-        # loss_z = self.kl_reg_loss(
-        #     1e-6,
-        #     gt_traj[:, :, :, 2],
-        #     pred_traj[:, :, :, 2],
-        #     pred_traj_std[:, :, :, 2],
-        #     ep,
-        # ).mean(dim=2)
-
-        # -------> add angle loss
-        # delta cost
-        gt_dx = torch.clip(gt_traj[:, :, 1:33, 0] -
-                           gt_traj[:, :, 0:32, 0], min=0.001)
-        gt_dy = gt_traj[:, :, 1:33, 1] - gt_traj[:, :, 0:32, 1]
-        gt_theta = torch.atan2(gt_dy, gt_dx) * (180 / np.pi)  # deg
-
-        DT = (
-            torch.Tensor(ANCHOR_TIME[1:33] - ANCHOR_TIME[0:32])
-            .expand([gt_theta.shape[0], 5, 32])
-            .to(gt_theta.device)
-        )
-        gt_ds = (gt_dx.pow(2) + gt_dy.pow(2)).sqrt() / DT
-
-        pred_dx = pred_traj[:, :, 1:33, 0] - pred_traj[:, :, 0:32, 0]
-        pred_dy = pred_traj[:, :, 1:33, 1] - pred_traj[:, :, 0:32, 1]
-        pred_theta = torch.atan2(pred_dy, pred_dx) * (180 / np.pi)  # deg
-
-        pred_ds = (pred_dx.pow(2) + pred_dy.pow(2)).sqrt() / DT
-
-        loss_delta_theta = self.reg_loss_func_L1(pred_theta, gt_theta).mean(
-            dim=(2)
-        )  # averge point angle loss
-        loss_delta_ds = self.reg_loss_func_L1(pred_ds, gt_ds).mean(
-            dim=(2)
-        )  # averge point angle loss
-
-        # add y-loss, most care about!
-        traj_loss = (
-            (loss_x + 5 * loss_y) +
-            loss_delta_theta + loss_delta_ds
-        )
-        # -------> find best trajectory index, use angle minimum or distance minimun
-        if self.is_use_angle_dist:
-            angle_dist = 1 - self.distance_func(
-                pred_traj[:, :, -1, 0:2], gt_traj[:, :, -1, 0:2]
-            )  # B, M
-            index = angle_dist.argmin(dim=1)
-            pred_index = plan_cls.softmax(dim=1).argmax(dim=1)
-            # min_angle_dist = angle_dist[torch.tensor(range(len(index)), device=index.device), index, ...]
-            pred_angle_dist = angle_dist[torch.tensor(range(len(pred_index)), device=pred_index.device), pred_index, ...]
-            pred_x = pred_traj[torch.tensor(range(len(pred_index)), device=pred_index.device), pred_index, -1,0]
-            index = torch.where(pred_x * pred_angle_dist > 2.8, index, pred_index)
-        else:
-            index = traj_loss.argmin(dim=1)
-
-        # first 3 epoch, training every head
-        if ep <= 4:
-            index = torch.randint(
-                0, 5, (traj_loss.shape[0],)).to(traj_loss.device)
-            cls_weight = 0
-        # -------> caculate best regression trajectory loss
-        reg_loss_best = traj_loss[
-            torch.tensor(range(len(index)), device=index.device), index, ...
-        ].mean()
-        # -------> caculate best regression class loss
-        gt_cls = index
-        cls_loss = self.cls_loss_func(plan_cls, gt_cls)
-        # we not traing class, we random train every at early  cls_weight
-        total_loss = pose_loss + reg_loss_best + cls_weight * cls_loss
-        self.count += 1
-
-        # -------> send best trajectory for closed loop online control
-        best_traj = pred_traj[
-            torch.tensor(range(len(index)), device=index.device), index, ...
-        ]
-
-        # return
-        return (
-            total_loss,
-            reg_loss_best,
-            cls_loss,
-            m_loss_x_L1[
-                torch.tensor(range(len(index)),
-                             device=index.device), index, ...
-            ].mean(),
-            m_loss_y_L1[
-                torch.tensor(range(len(index)),
-                             device=index.device), index, ...
-            ].mean(),
-            loss_delta_theta[
-                torch.tensor(range(len(index)),
-                             device=index.device), index, ...
-            ].mean(),
-            m_loss_vx,
-            m_loss_wz,
-        ), best_traj
+        
