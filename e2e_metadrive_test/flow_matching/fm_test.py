@@ -97,7 +97,7 @@ def test_and_save_model():
     for epoch in range(num_epochs):
         try:
             # 创建模拟数据
-            features, _ = create_mock_data(batch_size=1)  # 使用较小的batch size
+            features, _ = create_mock_data(batch_size=5)  # 使用较小的batch size
             camera_feature: torch.Tensor = features["camera_feature"].cuda()
             gt_trajs=features['gt_trajs'].cuda()
             

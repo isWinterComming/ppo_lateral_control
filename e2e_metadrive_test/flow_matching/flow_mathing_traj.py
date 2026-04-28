@@ -20,7 +20,7 @@ class FlowMathingConfig:
     y_scale: float =15
 
     # 多模态轨迹数量
-    anchor_size: int=10
+    anchor_size: int=7
 
     # Transformer
     tf_d_model: int = 256
@@ -47,11 +47,11 @@ class GoalFlowTrajModel(nn.Module):
         self._query_embedding = nn.Embedding(1, config.tf_d_model)
 
         tf_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.tf_d_model,
-            nhead=config.tf_num_head,
-            dim_feedforward=config.tf_d_ffn,
-            dropout=config.tf_dropout,
-            batch_first=True,
+            d_model=config.tf_d_model, # 特征维度
+            nhead=config.tf_num_head, # 注意力头数
+            dim_feedforward=config.tf_d_ffn, # FFN隐藏层维度
+            dropout=config.tf_dropout, # dropout比率
+            batch_first=True, # 批次在第一维
         )
         self._tf_decoder = nn.TransformerDecoder(tf_decoder_layer, config.tf_num_layers)
 
@@ -99,11 +99,16 @@ class GoalFlowTrajModel(nn.Module):
         device=camera_feature.device
 
         # =================================== feature decoder ==================================================
+        # keyval [bz, H*W, tf_d_model]
         keyval = camera_feature + self._keyval_embedding.weight[None, ...]
 
+
+        # 将整条轨迹压缩为单个向量, query [bz, 1， tf_d_model]
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
         # cross attention
+        # trajectory_query [bz, 1， tf_d_model]
         trajectory_query = self._tf_decoder(query, keyval)
+        
 
 
         # =================================== flow ==================================================
@@ -112,12 +117,13 @@ class GoalFlowTrajModel(nn.Module):
         # 占位符张量，推理时为零张量
         target=torch.zeros_like(gt_trajs_)
 
+        # normal_trajs[bz, 3, 33]
         normal_trajs = self.normalize_xy(gt_trajs_, N=gt_trajs_.shape[-2]).to(gt_trajs_)
-        print('normal_trajs shape:',normal_trajs.shape)
+        # print('normal_trajs shape:',normal_trajs.shape)
         if self._config.training:
-            noise=torch.randn(size=(batch_size,3,33),device=normal_trajs.device,dtype=dtype).to(trajectory_query)*self._config.train_scale
+            noise=torch.randn(size=(batch_size,33,3),device=normal_trajs.device,dtype=dtype).to(trajectory_query)*self._config.train_scale
         else:
-            noise=torch.randn(size=(batch_size*self._config.anchor_size,3,33),dtype=dtype,device=device)*self._config.test_scale
+            noise=torch.randn(size=(batch_size*self._config.anchor_size,33,3),dtype=dtype,device=device)*self._config.test_scale
         global_feature=self.encode_scene_features(trajectory_query)
         loss = 0
 
@@ -132,7 +138,6 @@ class GoalFlowTrajModel(nn.Module):
 
             pred=self.denoise(noisy_traj_points,timesteps,global_feature).reshape(batch_size,-1,3)
             # print('pred shape:',pred.shape,'target shape:',target.shape)
-            target = target.permute(0,2,1)
 
             loss_x = (pred[..., 0] - target[..., 0]).square().mean()
             loss_y = (pred[..., 1] - target[..., 1]).square().mean()
@@ -142,8 +147,9 @@ class GoalFlowTrajModel(nn.Module):
         # =================================== flow sampling ==================================================
         else:
             trajs=noise
-
+            # features [bz * anchor_size, 1, 256]
             features=global_feature[0].unsqueeze(1).repeat(1,self._config.anchor_size,1,1).view(-1,1,self._config.tf_d_model)
+            # embedding [bz * anchor_size, 1, 256]
             embedding=global_feature[1].unsqueeze(1).repeat(1,self._config.anchor_size,1,1).view(-1,1,self._config.tf_d_model)
             global_feature=(features,embedding)
             timesteps=torch.arange(self._config.infer_steps).to(device)
@@ -151,7 +157,7 @@ class GoalFlowTrajModel(nn.Module):
             # ODE求解，欧拉法
             for t in timesteps:
                 net_output_nonavi=self.denoise(trajs,t,global_feature)
-                net_output=net_output_nonavi.reshape(self._config.anchor_size*batch_size,3,33)
+                net_output=net_output_nonavi.reshape(self._config.anchor_size*batch_size,33,3)
                 # print('net_output_nonavi',net_output_nonavi.shape, net_output.shape)
                 trajs=trajs.detach().clone()+net_output*(1 / self._config.infer_steps)
         
@@ -171,6 +177,7 @@ class GoalFlowTrajModel(nn.Module):
     def denoise(self, ego_trajectory, sigma, state_features):
         batch_size = ego_trajectory.shape[0]
 
+        # state_type_embedding [bz, 1, 256]
         state_features, state_type_embedding = state_features
         
         # Trajectory features
@@ -178,12 +185,15 @@ class GoalFlowTrajModel(nn.Module):
         trajectory_features = self.trajectory_encoder(ego_trajectory)
 
         # 为轨迹点生成类型嵌入
+        # trajectory_type_embedding [bz, 33, 256]
         trajectory_type_embedding = self.type_embedding(
             torch.as_tensor([1], device=ego_trajectory.device)
         )[None].repeat(batch_size,33,1)
 
         # Concatenate all features
+        # all_features [bz, 1+33, 256]
         all_features = torch.cat([state_features, trajectory_features], dim=1)
+        # all_type_embedding [bz, 1+33, 256]
         all_type_embedding = torch.cat([state_type_embedding, trajectory_type_embedding], dim=1)
 
         # Sigma encoding
@@ -192,11 +202,16 @@ class GoalFlowTrajModel(nn.Module):
             sigma = sigma.repeat(batch_size,1)
         sigma = sigma.float() / self._config.infer_steps
         sigma_embeddings = self.sigma_encoder(sigma)
+        # sigma_embeddings [bz, 1, 256]
         sigma_embeddings = sigma_embeddings.reshape(batch_size,1,self._config.tf_d_model)
+        
 
         # Concatenate sigma features and project back to original feature_dim
+        # sigma_embeddings [bz, 34, 256]
         sigma_embeddings = sigma_embeddings.repeat(1,all_features.shape[1],1)
+        # all_features[bz, 34, 512] 
         all_features = torch.cat([all_features, sigma_embeddings], dim=2)
+        # all_features投影后 [bz, 34, 256] [原始特征, 时间步编码](类似多模态输入）拼接->投影->融合
         all_features = self.sigma_proj_layer(all_features)
 
         # Generate attention mask
@@ -206,6 +221,8 @@ class GoalFlowTrajModel(nn.Module):
         attn_mask = dists > 1       # TODO: magic number
 
         # Generate relative temporal embeddings
+        # 序列轨迹点时间编码ROPE
+        # temporal_embedding [bz, 34, 256, 2]
         temporal_embedding = self.trajectory_time_embeddings(indices[None].repeat(batch_size,1))
 
         # Global self-attentions
@@ -216,15 +233,16 @@ class GoalFlowTrajModel(nn.Module):
                 seq1_sem_pos=all_type_embedding,
                 attn_mask_11=attn_mask
             )
-
+        # all_features [bz, 34, 256]
         trajectory_features = all_features[:,-33:]
+        # out [bz, 33, 3]
         out = self.decoder_mlp(trajectory_features).reshape(trajectory_features.shape[0],-1)
 
         return out 
 
 
     def denormalize_xy(self, trajectory, N=33):
-        final_trajectory = trajectory.permute(0,2,1)
+        final_trajectory = trajectory
         
         final_trajectory = final_trajectory[:, :, :3]
         final_trajectory[:, :, 0] *= self._config.x_scale
@@ -233,8 +251,6 @@ class GoalFlowTrajModel(nn.Module):
         return final_trajectory   
     def normalize_xy(self, trajectory, N=33):
         downsample_trajectory = trajectory[:, :N, :].detach().clone()
-        x_scale = 60
-        y_scale = 15
         heading_scale = math.pi
         downsample_trajectory[:, :, 0] /= self._config.x_scale
         downsample_trajectory[:, :, 1] /= self._config.y_scale
@@ -244,11 +260,10 @@ class GoalFlowTrajModel(nn.Module):
         eps = 1e-7
         x_clamped = torch.clamp(x, -0.999 + eps, 0.999 - eps)
         # 使用对数公式计算 atanh
+        # 这里主要是应为onnx导出不支持atanh算子转换，所以自己写
         downsample_trajectory[:,:,2] = 0.5 * torch.log((1 + x_clamped) / (1 - x_clamped))
 
-        
-        
-        trajectory = downsample_trajectory.permute(0,2,1)
+        trajectory = downsample_trajectory
         return trajectory
     
     def encode_scene_features(self, ego_agent_features):
@@ -264,6 +279,4 @@ def get_train_tuple(z0=None, z1=None):
     z_t =  t * z1 + (1.-t) * z0
     target = z1 - z0
     return z_t.float(), t.float(), target.float()
-
-
 
