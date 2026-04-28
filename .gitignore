@@ -3,3 +3,6 @@ __pycache__/
 Log
 ./e2e_metadrive_test/images/
 ./e2e_metadrive_test/output.mp4
+
+/e2e_metadrive_test/output
+/.vscode
